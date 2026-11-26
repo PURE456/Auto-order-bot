@@ -188,15 +188,16 @@ export function startOrderBookFeed(tokenIds: string[]): { stop: () => void } {
 
       for (const message of messages) {
         if (message.event_type === "book" && message.asset_id) {
-          liveQuotes.set(
-            message.asset_id,
-            getQuote({ bids: message.bids ?? [], asks: message.asks ?? [] }),
-          );
+          liveQuotes.set(message.asset_id, {
+            ...getQuote({ bids: message.bids ?? [], asks: message.asks ?? [] }),
+            at: Date.now(),
+          });
         } else if (message.event_type === "price_change") {
           for (const change of message.price_changes ?? []) {
             liveQuotes.set(change.asset_id, {
               bid: toPrice(change.best_bid),
               ask: toPrice(change.best_ask),
+              at: Date.now(),
             });
           }
         }

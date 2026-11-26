@@ -38,6 +38,7 @@ export type OrderBook = {
 export type Quote = {
   bid: number | undefined;
   ask: number | undefined;
+  at?: number; // our clock (ms) when the live feed last updated this quote
 };
 
 export type DurationConfig = {
@@ -114,8 +115,10 @@ export const CLOB_WS_URL = "wss://ws-subscriptions-clob.polymarket.com/ws/market
 // Files
 export const OUTCOMES_FILE = "window-outcomes.csv"; // official open/close TWAP per window
 export const FINGERPRINT_FILE = "fingerprint.json"; // latest fit, read by the paper trader
-export const SIGNALS_FILE = "fingerprint-signals.csv"; // every second that passed the signal test
-export const PAPER_TRADES_FILE = "fingerprint-trades.csv"; // paper trades and their results
+// v2: the rules and columns changed after the first paper day (25 Nov), so
+// don't mix with the older rows in fingerprint-signals.csv / fingerprint-trades.csv.
+export const SIGNALS_FILE = "fingerprint-signals-v2.csv"; // every second that passed the signal test
+export const PAPER_TRADES_FILE = "fingerprint-trades-v2.csv"; // paper trades and their results
 
 // Market mechanics
 export const WINDOW_SECONDS = 300; // 5-minute markets
@@ -126,6 +129,11 @@ export const FEE_RATE = 0.05; // taker fee = shares × FEE_RATE × p × (1 − p
 export const EWMA_LAMBDA = 0.97; // volatility from an EWMA of 1-second log returns
 export const DEFAULT_FEED_BIAS = 0; // b, used until the first fit measures it
 export const DEFAULT_FEED_NOISE = 2e-5; // s (log units, ≈ $1.2 at $60k), used until measured
+// When the model and the market disagree, the truth is in between. The edge
+// and the bet size use Φ(w·z_model + (1 − w)·z_market). Measured on the
+// recorder data of 20–22 Nov (best w: late 0.5, early 0.1) and on the 69 paper
+// trades of 25 Nov (best w: 0.3). Re-measure when there is more data.
+export const MODEL_WEIGHT = { early: 0.1, late: 0.5 };
 
 // Crowd fingerprint fit
 export const FIT_DAYS = 7; // refit on the last 7 days
@@ -143,7 +151,8 @@ export const MIN_EDGE = 0.01; // per share, after fees
 export const KELLY_FRACTION = 1 / 8;
 export const MAX_PER_TRADE = 5; // dollars
 export const SKIP_WINDOWS_ET = ["08:30", "09:30"]; // windows starting at these ET times
-export const JUMP_SIGMAS = 4; // a 1-second move above 4σ is a jump...
+export const JUMP_SIGMAS = 4; // a move above 4σ√dt is a jump...
+export const JUMP_LOOKBACK_SECONDS = 5; // ...measured over every span up to 5 s...
 export const JUMP_COOLDOWN_MS = 30_000; // ...and blocks entries for 30 s
 
 // Risk limits (paper money for now)
@@ -151,6 +160,7 @@ export const BANKROLL = 200;
 export const DAILY_LOSS_LIMIT = 20; // stop for the rest of the UTC day
 export const MAX_DRAWDOWN = 100; // end the experiment
 export const STALE_PRICE_MS = 2000; // no BTC price for 2 s = pause
+export const STALE_QUOTE_MS = 5000; // no order book update for 5 s = pause (my choice)
 export const FEED_GAP_NOISE_MULTIPLE = 3; // our TWAP vs Chainlink's off by > 3 × s = pause
 
 // Experiment gates

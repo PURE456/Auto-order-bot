@@ -19,6 +19,7 @@ import {
   REFIT_EVERY_MS,
   SIGNALS_FILE,
   STALE_PRICE_MS,
+  STALE_QUOTE_MS,
   TWAP_WINDOW_SECONDS,
 } from "../config.js";
 import {
@@ -103,13 +104,14 @@ function writeHeaders() {
   if (!existsSync(SIGNALS_FILE)) {
     appendFileSync(
       SIGNALS_FILE,
-      "time,market,secondsLeft,bucket,d,sigma,pTrueUp,upMid,zGap,side,ask,edge,action\n",
+      "time,market,secondsLeft,bucket,d,sigma,pTrueUp,upMid,zGap,side,ask,pUsed,edge," +
+        "quoteAgeSec,action\n",
     );
   }
   if (!existsSync(PAPER_TRADES_FILE)) {
     appendFileSync(
       PAPER_TRADES_FILE,
-      "time,market,bucket,side,zGap,pTrue,fillPrice,feePerShare,shares,cost," +
+      "time,market,bucket,side,zGap,pTrue,pUsed,fillPrice,feePerShare,shares,cost," +
         "kEarly,alphaEarly,kLate,alphaLate,outcome,pnl,edgePerShare\n",
     );
   }
@@ -140,6 +142,7 @@ async function settle(position: Position) {
       position.bucket,
       position.side,
       position.zGap.toFixed(4),
+      position.modelProbability.toFixed(4),
       position.probability.toFixed(4),
       position.ask,
       takerFeePerShare(position.ask).toFixed(5),
@@ -308,6 +311,9 @@ export async function runFingerprintPaper() {
           const exact = getExactTwap();
           const ours = exact && now - exact.at < 15_000 ? twapAt(exact.at) : undefined;
           const feedGap = exact && ours ? Math.abs(Math.log(ours / exact.value)) : 0;
+          // The book feed sends every change, so a long silence on either
+          // side means the prices we see may no longer be there
+          const quoteAge = now - Math.min(up.at ?? 0, down.at ?? 0);
 
           let action: string;
           if (position) action = "ALREADY_IN";
@@ -315,6 +321,7 @@ export async function runFingerprintPaper() {
           else if (skipWindow) action = "SKIP_WINDOW";
           else if (now - lastJumpAt < JUMP_COOLDOWN_MS) action = "JUMP";
           else if (now - getLastTickReceivedAt() > STALE_PRICE_MS) action = "STALE";
+          else if (quoteAge > STALE_QUOTE_MS) action = "STALE_QUOTE";
           else if (feedGap > FEED_GAP_NOISE_MULTIPLE * s) action = "FEED_GAP";
           else if (!fp) action = "NO_FIT";
           else if (fp.converged) action = "CONVERGED";
@@ -340,7 +347,8 @@ export async function runFingerprintPaper() {
               };
               console.log(
                 `  [${Math.round(secondsLeft)}s left] PAPER BUY ${signal.side} ${shares.toFixed(2)} shares ` +
-                  `at ${signal.ask} ($${stake.toFixed(2)}), P_true ${signal.probability.toFixed(3)}, ` +
+                  `at ${signal.ask} ($${stake.toFixed(2)}), P_true ${signal.modelProbability.toFixed(3)}, ` +
+                  `blended ${signal.probability.toFixed(3)}, ` +
                   `z_gap ${signal.zGap.toFixed(2)}, edge ${signal.edge.toFixed(3)}`,
               );
             } else {
@@ -362,7 +370,9 @@ export async function runFingerprintPaper() {
               signal.zGap.toFixed(4),
               signal.side,
               signal.ask,
+              signal.probability.toFixed(4),
               signal.edge.toFixed(4),
+              (quoteAge / 1000).toFixed(1),
               action,
             ].join(",") + "\n",
           );
@@ -373,7 +383,11 @@ export async function runFingerprintPaper() {
 
       // Rule 6: hold to settlement. Settle in the background.
       if (position) settle(position);
-      else console.log("  No trade this window.");
+      else {
+        console.log("  No trade this window.");
+        // Save the result anyway, so signals we did not trade can be checked later
+        fetchOutcomeWhenReady(market.slug).catch(() => undefined);
+      }
     } catch (error) {
       console.error("Error, retrying in 5 seconds:", error);
       await sleep(5000);

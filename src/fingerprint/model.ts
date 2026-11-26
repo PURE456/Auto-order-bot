@@ -7,12 +7,14 @@ import {
   FEE_RATE,
   FIT_MAX_PRICE,
   FIT_MIN_PRICE,
+  JUMP_LOOKBACK_SECONDS,
   JUMP_SIGMAS,
   KELLY_FRACTION,
   MIN_ABS_D_OVER_SIGMA,
   MIN_EDGE,
   MIN_FIT_POINTS,
   MIN_Z_GAP,
+  MODEL_WEIGHT,
   TWAP_WINDOW_SECONDS,
 } from "../config.js";
 
@@ -100,31 +102,46 @@ export class VolatilityTracker {
   private variance: number | undefined; // per second, in log units
   private warmup: number[] = [];
   private last: { t: number; price: number } | undefined;
+  private recent: { t: number; price: number }[] = []; // last few seconds, for jumps
 
   // σ per √second, or undefined until 30 returns have been seen
   get sigma(): number | undefined {
     return this.variance === undefined ? undefined : Math.sqrt(this.variance);
   }
 
-  // Feeds one price. Returns true if this move was a jump (> 4σ).
+  // Feeds one price. Returns true if the move over any of the last few
+  // seconds was a jump (> 4σ√dt). One price to the next is not enough: a fast
+  // move spread over several prices would pass unnoticed.
   update(t: number, price: number): boolean {
     const last = this.last;
     this.last = { t, price };
-    if (!last) return false;
+    if (!last) {
+      this.recent = [{ t, price }];
+      return false;
+    }
 
     const dt = (t - last.t) / 1000;
     // A long gap (reconnect, missing data) breaks the series: start over
     if (dt <= 0 || dt > 10) {
       this.variance = undefined;
       this.warmup = [];
+      this.recent = [{ t, price }];
       return false;
     }
 
     const r = Math.log(price / last.price);
     const perSecond = (r * r) / dt;
     const sigmaBefore = this.sigma;
+
+    this.recent = this.recent.filter((old) => t - old.t <= JUMP_LOOKBACK_SECONDS * 1000);
     const isJump =
-      sigmaBefore !== undefined && Math.abs(r) > JUMP_SIGMAS * sigmaBefore * Math.sqrt(dt);
+      sigmaBefore !== undefined &&
+      this.recent.some(
+        (old) =>
+          Math.abs(Math.log(price / old.price)) >
+          JUMP_SIGMAS * sigmaBefore * Math.sqrt((t - old.t) / 1000),
+      );
+    this.recent.push({ t, price });
 
     if (this.variance === undefined) {
       // Plain average of the first 30 returns, then switch to EWMA
@@ -273,7 +290,8 @@ export type Signal = {
   bucket: "early" | "late";
   zGap: number;
   side: Side;
-  probability: number; // P_true of the side we'd buy
+  modelProbability: number; // P_true of the side we'd buy, from the model alone
+  probability: number; // model blended with the market: used for edge and size
   ask: number;
   cost: number; // ask + fee
   edge: number; // P − c
@@ -295,23 +313,30 @@ export function evaluateSignal(input: {
   const { secondsLeft, pTrueUp, upBid, upAsk, downBid, downAsk, bias } = input;
 
   const upMid = (upBid + upAsk) / 2;
-  const zGap = normInv(pTrueUp) - normInv(upMid);
+  const zMarket = normInv(upMid);
+  const zGap = normInv(pTrueUp) - zMarket;
   if (Math.abs(zGap) < MIN_Z_GAP) return undefined;
+
+  const bucket = secondsLeft > TWAP_WINDOW_SECONDS ? "early" : "late";
+
+  // The model is right on average, but not when it disagrees with the market:
+  // there the truth is in between. So only part of the gap counts as edge.
+  const blendedUp = normCdf(zMarket + MODEL_WEIGHT[bucket] * zGap);
 
   // Truth above the market: Up is too cheap. Below: Down is too cheap.
   const side: Side = zGap > 0 ? "UP" : "DOWN";
-  const probability = side === "UP" ? pTrueUp : 1 - pTrueUp;
+  const modelProbability = side === "UP" ? pTrueUp : 1 - pTrueUp;
+  const probability = side === "UP" ? blendedUp : 1 - blendedUp;
   const ask = side === "UP" ? upAsk : downAsk;
   const sideMid = side === "UP" ? upMid : (downBid + downAsk) / 2;
   const cost = costPerShare(ask);
   const edge = probability - cost;
   if (edge < MIN_EDGE) return undefined;
 
-  const bucket = secondsLeft > TWAP_WINDOW_SECONDS ? "early" : "late";
   const biasMatches =
     bucket === "late"
       ? !!bias?.late && sideMid > 0.5 // late bias → buy the leading side
       : !!bias?.early && sideMid < 0.5; // early bias → buy the cheaper side
 
-  return { bucket, zGap, side, probability, ask, cost, edge, biasMatches };
+  return { bucket, zGap, side, modelProbability, probability, ask, cost, edge, biasMatches };
 }
